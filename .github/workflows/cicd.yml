@@ -1,0 +1,102 @@
+name: Deploy Flask App to Touge Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:   # 额外添加：可在 Actions 页面手动点 "Run workflow" 重新运行
+
+env:
+  # ===== 头歌服务器 SSH 端口 =====
+  # 实验环境重开后端口可能会变（讲义里是 50241），变了只需改这一行
+  TOUGE_SSH_PORT: 43765
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies and run tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==8.4.1
+          pytest tests/ -v
+        continue-on-error: false
+
+      - name: Deploy to Touge Server via SSH (Port ${{ env.TOUGE_SSH_PORT }})
+        env:
+          TOUGE_SSH_PRIVATE_KEY: ${{ secrets.TOUGE_SSH_PRIVATE_KEY }}
+          TOUGE_SERVER_IP: ${{ secrets.TOUGE_SERVER_IP }}
+        run: |
+          # 检查 Secrets 是否已配置
+          if [ -z "$TOUGE_SSH_PRIVATE_KEY" ] || [ -z "$TOUGE_SERVER_IP" ]; then
+            echo "::error::未读取到 TOUGE_SSH_PRIVATE_KEY 或 TOUGE_SERVER_IP，请先在仓库 Settings > Secrets and variables > Actions 中配置"
+            exit 1
+          fi
+
+          # 配置SSH环境
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # 写入RSA私钥（tr 去掉从 Windows 复制时可能带上的 \r，避免私钥格式错误）
+          printf '%s\n' "$TOUGE_SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+
+          # 强制设置权限（SSH协议要求）
+          chmod 600 ~/.ssh/id_rsa
+
+          # 扫描主机密钥（指定端口），避免首次连接卡在 yes/no 确认
+          ssh-keyscan -T 15 -p "$TOUGE_SSH_PORT" -H "$TOUGE_SERVER_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "SSH环境配置完成，尝试连接服务器..."
+
+          # 连接服务器执行部署（-o 选项兼容旧版SSH）
+          ssh -p "$TOUGE_SSH_PORT" -i ~/.ssh/id_rsa \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            -o HostKeyAlgorithms=+ssh-rsa \
+            -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+            root@"$TOUGE_SERVER_IP" 'bash -s' << 'EOF'
+          set -e
+          echo "成功连接服务器：$(whoami)@$(hostname)"
+
+          cd /root/flask-web-app || { echo "项目目录不存在（请先完成手动部署）"; exit 1; }
+
+          # 拉取 main 分支最新代码（fetch + reset：服务器上有改动也不会冲突）
+          git fetch origin main || { echo "Git拉取失败"; exit 1; }
+          git reset --hard origin/main
+          echo "当前部署版本：$(git log -1 --oneline)"
+
+          # 安装依赖（新版 Ubuntu 若有 PEP 668 限制，自动加 --break-system-packages 重试）
+          pip3 install -r requirements.txt \
+            || pip3 install --break-system-packages -r requirements.txt \
+            || { echo "依赖安装失败"; exit 1; }
+
+          # supervisord 没在运行（例如环境重启过）就先把它启动
+          if ! pgrep -x supervisord > /dev/null; then
+            echo "supervisord 未运行，正在启动..."
+            service supervisor start || supervisord -c /etc/supervisor/supervisord.conf
+            sleep 2
+          fi
+
+          supervisorctl restart flask-web-app || { echo "应用重启失败"; exit 1; }
+          sleep 3
+          supervisorctl status flask-web-app
+
+          # 在服务器本机访问一次，确认应用返回内容
+          python3 -c "import urllib.request as u; print('应用返回：', u.urlopen('http://127.0.0.1:5000/', timeout=5).read().decode())" \
+            || { echo "应用未正常响应，请查看 /root/flask-web-app/app.log"; exit 1; }
+          echo "部署完成"
+          EOF
